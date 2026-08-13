@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>Cadastro de Clientes — Sentinel QA (Interno)</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<main>
+  <h1>Cadastro de Clientes</h1>
+  <p class="subtitle">App alvo de QA — ambiente INTERNAL (clonado via GitHub pelo Sentinel)</p>
+
+  <form id="form-novo-cliente">
+    <input type="text" data-testid="cliente-nome-input" placeholder="Nome" required />
+    <input type="email" data-testid="cliente-email-input" placeholder="E-mail" required />
+    <button type="submit" data-testid="cliente-add-button">Adicionar</button>
+  </form>
+
+  <ul id="lista-clientes"></ul>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

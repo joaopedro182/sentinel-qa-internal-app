@@ -1,0 +1,14 @@
+{
+  "name": "sentinel-qa-internal-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CRUD mínimo de clientes — app alvo para sessão de QA do Sentinel (ambiente INTERNAL, clonado via githubRepo).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
