@@ -1,0 +1,185 @@
+name: Sentinel Generate Test From Recording
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Publicly fetchable URL of the raw QA screen recording (video, with narration audio embedded)"
+        required: true
+      environment_url:
+        description: "Base URL of the environment being tested — reachable from this runner"
+        required: true
+      head_branch:
+        description: "Branch this job creates and pushes the generated test to"
+        required: true
+      correlation_id:
+        description: "Opaque id echoed back so the caller can correlate this run — no functional use"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Correlation id
+        run: echo "correlation_id=${{ github.event.inputs.correlation_id }}"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "sentinel-bot"
+          git config user.email "sentinel-bot@users.noreply.github.com"
+
+      - name: Create head branch
+        env:
+          HEAD_BRANCH: ${{ github.event.inputs.head_branch }}
+        run: git checkout -b "$HEAD_BRANCH"
+
+      - name: Detect package manager and install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            corepack prepare pnpm@latest --activate
+            pnpm install --no-frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --no-frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci --prefer-offline
+          else
+            npm install
+          fi
+
+      - name: Install Playwright browsers (if applicable)
+        run: |
+          if node -e "const p=require('./package.json'); process.exit((p.dependencies&&p.dependencies['@playwright/test'])||(p.devDependencies&&p.devDependencies['@playwright/test'])?0:1)" 2>/dev/null; then
+            npx playwright install --with-deps chromium
+          else
+            echo "Playwright not declared in package.json — Claude will add it if needed"
+          fi
+
+      - name: Download recording
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+        run: |
+          ext="${VIDEO_URL##*.}"
+          case "$ext" in
+            mp4|mov|webm|mkv|avi) : ;;
+            *) ext="mp4" ;;
+          esac
+          if [[ "$VIDEO_URL" == *"drive.google.com"* ]]; then
+            # Drive share links don't serve the raw file directly — for anything
+            # above ~25MB Google interposes a virus-scan warning page that plain
+            # curl can't get past. gdown resolves the file id and that dance for us.
+            pip install --quiet gdown
+            file_id=$(echo "$VIDEO_URL" | grep -oP '(?<=/d/)[^/]+' || echo "$VIDEO_URL" | grep -oP '(?<=id=)[^&]+')
+            gdown "https://drive.google.com/uc?id=$file_id" -O "/tmp/recording.$ext"
+          else
+            curl -fsSL "$VIDEO_URL" -o "/tmp/recording.$ext"
+          fi
+          echo "RECORDING_PATH=/tmp/recording.$ext" >> "$GITHUB_ENV"
+
+      - name: Build whisper.cpp (audio transcription)
+        run: |
+          git clone --depth=1 https://github.com/ggerganov/whisper.cpp /tmp/whisper.cpp
+          cmake -B /tmp/whisper.cpp/build -S /tmp/whisper.cpp -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/whisper.cpp/build --config Release -j "$(nproc)"
+          # Multilingual model (not "base.en") — the QA narrating the recording may not be
+          # speaking English; whisper.cpp auto-detects the spoken language at transcribe time.
+          bash /tmp/whisper.cpp/models/download-ggml-model.sh base /tmp/whisper.cpp/models
+          echo "WHISPER_BIN=/tmp/whisper.cpp/build/bin/whisper-cli" >> "$GITHUB_ENV"
+          echo "WHISPER_MODEL=/tmp/whisper.cpp/models/ggml-base.bin" >> "$GITHUB_ENV"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Claude Code agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ENVIRONMENT_URL: ${{ github.event.inputs.environment_url }}
+        run: |
+          cat > /tmp/generate-prompt.txt <<PROMPT
+          Você é um engenheiro de testes E2E (Playwright/TypeScript) sênior.
+
+          Uma pessoa de QA gravou a tela do navegador (com narração em áudio) enquanto
+          validava manualmente um fluxo da aplicação. Seu trabalho é assistir essa gravação
+          e transformá-la em UM teste Playwright — reproduzindo o fluxo demonstrado, não
+          inventando um novo.
+
+          O arquivo de vídeo bruto está em: $RECORDING_PATH
+          A URL base do ambiente sob teste é: $ENVIRONMENT_URL
+
+          Passo a passo esperado (você decide os detalhes de cada etapa, mas siga esta ordem):
+
+          1. Transcreva a narração em áudio do vídeo usando o binário já compilado (modelo
+             multilíngue — detecta o idioma automaticamente, não assuma que é inglês):
+             \`$WHISPER_BIN -m \$WHISPER_MODEL -l auto -f <audio extraído com ffmpeg> --output-txt\`
+             (extraia o áudio do vídeo primeiro com ffmpeg, ex.: \`ffmpeg -i "\$RECORDING_PATH" -vn -ar 16000 -ac 1 /tmp/audio.wav\`)
+          2. Extraia frames do vídeo com ffmpeg (ex. 1 frame a cada 1-2s, ou mais denso em
+             trechos com mais atividade) e USE a ferramenta Read para visualizar os frames
+             relevantes — é assim que você identifica em quais elementos da tela o QA clicou.
+          3. Explore o repositório (Grep/Glob/Read) pra entender a stack, achar specs Playwright
+             já existentes e seguir o MESMO estilo (imports, helpers, estrutura de describe/test).
+          4. Escreva UM arquivo de teste Playwright (.spec.ts) que reproduza o fluxo demonstrado,
+             narrado, no vídeo — usando \`page.goto('$ENVIRONMENT_URL')\` como ponto de partida
+             e seletores semânticos (getByRole/getByLabel/getByTestId) sempre que possível.
+          5. Rode o teste de verdade (ex. \`npx playwright test <arquivo>\`) contra o ambiente
+             real. Se falhar, ajuste o teste e rode de novo — você tem autonomia pra iterar até
+             o teste passar ou até esgotar tentativas razoáveis (não passe de ~5 rodadas).
+          6. Ao final — teste passando ou não — faça commit do(s) arquivo(s) de teste gerado(s)
+             (\`git add\` + \`git commit\`). NÃO faça push, isso é feito por um passo seguinte
+             do workflow.
+          7. Escreva em /tmp/sentinel-meta.json (FORA do repositório, não commitar) um JSON no
+             formato: [{"filePath": "caminho/relativo/do/spec.ts", "humanDescription": "2-4
+             frases em pt-BR explicando o que o teste valida, para leitores não técnicos"}]
+
+          Se o teste não passar após suas tentativas, faça o commit do melhor resultado mesmo
+          assim — a revisão humana decide se aceita ou não via Pull Request.
+          PROMPT
+
+          claude -p             --allowedTools "Read" "Write" "Edit" "Grep" "Glob" "Bash"             --max-turns 60             --output-format text             < /tmp/generate-prompt.txt | tee /tmp/claude-output.log
+        continue-on-error: true
+        id: claude_agent
+
+      - name: Ensure something was committed
+        env:
+          HEAD_BRANCH: ${{ github.event.inputs.head_branch }}
+          BASE_REF: ${{ github.ref_name }}
+        run: |
+          git add -A
+          git diff --cached --quiet || git commit -m "sentinel: generated test from QA recording"
+          if [ "$(git rev-list --count HEAD "^origin/$BASE_REF" 2>/dev/null || echo 0)" = "0" ]; then
+            echo "No commits were produced — Claude did not generate a usable test."
+            exit 1
+          fi
+
+      - name: Push head branch
+        env:
+          HEAD_BRANCH: ${{ github.event.inputs.head_branch }}
+        run: git push origin "HEAD:$HEAD_BRANCH"
+
+      - name: Upload recording metadata artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-meta
+          path: /tmp/sentinel-meta.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload agent log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log
+          path: /tmp/claude-output.log
+          retention-days: 7
+          if-no-files-found: ignore
